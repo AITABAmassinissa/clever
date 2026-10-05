@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prépare un nouveau nœud Kubernetes imbriqué dans un Pod Linux privilégié.
-# Usage : sudo bash all_nodes.sh [--node-ip IP] [--interface eth0]
-# Après préparation : sudo bash all_nodes.sh --start-only
+# Usage : sudo bash all_nodes_local.sh [--node-ip IP] [--interface eth0]
+# Après préparation : sudo bash all_nodes_local.sh --start-only
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -10,8 +10,7 @@ CNI_VERSION=v1.9.1
 NODE_IFACE=eth0
 NODE_IP=
 START_ONLY=0
-PVC_MOUNT=/var/lib/containerd
-DATA_ROOT=/var/lib/containerd/k8s-lab
+DATA_ROOT=/var/lib/k8s-lab
 CONTAINERD_ROOT=/var/lib/containerd
 MIN_FREE_GIB=2
 CONFIG_DIR=/etc/kubernetes-lab
@@ -74,14 +73,14 @@ die() { echo "ERREUR : $*" >&2; exit 1; }
 help() {
   cat <<'EOF'
 Préparation d'un nœud Ubuntu 24.04/26.04 dans un Pod privilégié.
-PVC obligatoire monté directement sur /var/lib/containerd ; un PVC par nœud.
+Stockage local uniquement : /var/lib/containerd et /var/lib/k8s-lab.
 
-  sudo bash all_nodes.sh [options]
+  sudo bash all_nodes_local.sh [options]
   --node-ip IP              IP IPv4 du nœud (détection sur eth0 par défaut)
   --interface NOM           Interface à utiliser (défaut eth0)
   --kubernetes-version VER  Défaut v1.35.9, identique sur tous les nœuds
   --cni-version VER         Défaut v1.9.1
-  --min-free-gib N          Espace libre minimal avant installation (défaut 2 Gio sur le PVC)
+  --min-free-gib N          Espace libre minimal avant installation (défaut 2 Gio sur le disque local)
   --start-only              Relance les processus déjà préparés, sans installation
   --help                    Affiche cette aide
 
@@ -104,9 +103,10 @@ while (($#)); do
     *) die "Option inconnue : $1";;
   esac
 done
-[[ $EUID == 0 ]] || die "Exécuter avec sudo bash all_nodes.sh."
+[[ $EUID == 0 ]] || die "Exécuter avec sudo bash all_nodes_local.sh."
 if ((START_ONLY)); then
   [[ -x /usr/local/sbin/k8s-lab-start ]] || die "Préparation absente."
+  . /etc/kubernetes-lab/environment
   exec /usr/local/sbin/k8s-lab-start
 fi
 trap 'echo "Échec de la préparation à la ligne $LINENO. Corriger avant de continuer." >&2' ERR
@@ -117,20 +117,21 @@ trap 'echo "Échec de la préparation à la ligne $LINENO. Corriger avant de con
 [[ $CNI_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version CNI invalide."
 [[ $NODE_IFACE =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "Interface invalide."
 [[ $MIN_FREE_GIB =~ ^[1-9][0-9]?$ ]] || die "--min-free-gib doit être un entier entre 1 et 99."
-mountpoint -q "$PVC_MOUNT" || die "PVC absent : monter un PVC sur $PVC_MOUNT avant installation."
-PVC_FSTYPE=$(findmnt -n -o FSTYPE -T "$PVC_MOUNT")
-[[ $PVC_FSTYPE == xfs || $PVC_FSTYPE == ext4 ]] || die "PVC attendu en XFS ou ext4, trouvé : $PVC_FSTYPE."
-[[ ! -e "$CONTAINERD_ROOT/io.containerd.metadata.v1.bolt/meta.db" ]] || die "Données containerd existantes : ce script prépare un PVC neuf, sans migration."
-install -d -m 0755 "$DATA_ROOT"
-[[ -w $DATA_ROOT ]] || die "PVC non accessible en écriture."
+[[ ! -e "$CONTAINERD_ROOT/io.containerd.metadata.v1.bolt/meta.db" ]] || die "Données containerd existantes : ce script prépare un runtime neuf, sans migration."
+install -d -m 0755 "$DATA_ROOT" "$CONTAINERD_ROOT"
+[[ -w $DATA_ROOT ]] || die "Dossier local non accessible en écriture."
+for DIR in "$DATA_ROOT" "$CONTAINERD_ROOT"; do
+  [[ $(stat -c %d "$DIR") == $(stat -c %d /) ]] || die "Stockage séparé détecté sur $DIR : cette version attend le système de fichiers racine."
+done
 [[ ! -f /etc/kubernetes/kubelet.conf && ! -f /etc/kubernetes/admin.conf ]] ||
   die "Nœud déjà configuré : utiliser --start-only, pas une nouvelle installation."
 [[ -z $(pgrep -x kubelet || true) ]] || die "Un kubelet existe déjà. Ne pas modifier un nœud actif."
 [[ $(awk 'NR>1 {n++} END {print n+0}' /proc/swaps) == 0 ]] ||
   die "Swap actif. Le script ne désactive pas le swap du noyau partagé."
 [[ $(df -Pk "$DATA_ROOT" | awk 'END {print $4}') -ge $((MIN_FREE_GIB*1048576)) ]] ||
-  die "Moins de $MIN_FREE_GIB Gio libres sur le PVC. Agrandir le PVC ou libérer son espace."
-echo "Stockage PVC : $PVC_MOUNT ; données du lab : $DATA_ROOT."
+  die "Moins de $MIN_FREE_GIB Gio libres sur le disque local. Libérer de l’espace ou utiliser un worker avec davantage de stockage."
+[[ $(df -Pk "$CONTAINERD_ROOT" | awk 'END {print $4}') -ge 2097152 ]] || die "Moins de 2 Gio libres pour les images sur le disque local."
+echo "Stockage local : données $DATA_ROOT ; images $CONTAINERD_ROOT."
 df -h "$DATA_ROOT"
 [[ $(stat -fc %T /sys/fs/cgroup) == cgroup2fs ]] || die "Ce lab attend cgroups v2."
 [[ -w /sys/fs/cgroup ]] || die "Cgroups non accessibles en écriture."
@@ -161,7 +162,7 @@ if [[ -e /proc/sys/net/bridge/bridge-nf-call-ip6tables ]]; then
   sysctl -w net.bridge.bridge-nf-call-ip6tables=1
 fi
 
-install -d -m 0755 "$DATA_ROOT"
+install -d -m 0755 "$DATA_ROOT" "$CONTAINERD_ROOT"
 install -d -m 0700 "$CONFIG_DIR" /etc/containerd-lab "$DATA_ROOT/logs" \
   "$DATA_ROOT/etcd" "$DATA_ROOT/kubelet" "$DATA_ROOT/pod-logs"
 exec 8>"$CONFIG_DIR/prepare.lock"
@@ -169,19 +170,7 @@ flock -n 8 || die "Autre préparation en cours."
 TMP_DIR=$(mktemp -d "$DATA_ROOT/install.XXXXXX")
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
-echo '[2/7] Tests OverlayFS sur le PVC, bind et VXLAN'
-# Tester OverlayFS sur le volume, pas sur la couche modifiable du Pod.
-(
-  set -e
-  T="$TMP_DIR/overlay-test"
-  mkdir -p "$T"/{lower,upper,work,merged}
-  trap 'if mountpoint -q "$T/merged"; then umount "$T/merged"; fi' EXIT
-  echo overlay-ok > "$T/lower/check"
-  mount -t overlay overlay -o "lowerdir=$T/lower,upperdir=$T/upper,workdir=$T/work" "$T/merged"
-  grep -Fxq overlay-ok "$T/merged/check"
-  echo write-ok > "$T/merged/write-check"
-  grep -Fxq write-ok "$T/upper/write-check"
-)
+echo '[2/7] Tests bind et VXLAN (snapshotter native)'
 (
   set -e
   T="$TMP_DIR/bind-test"
@@ -224,7 +213,7 @@ containerd config default > "$TMP_DIR/containerd.toml"
 python3 - "$TMP_DIR/containerd.toml" "$RUNTIME_CONFIG" "$RUNTIME_STATE" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
-text = re.sub(r'(?m)^(\s*snapshotter\s*=\s*)[\x27\x22]overlayfs[\x27\x22]', r"\1'overlayfs'", text)
+text = re.sub(r'(?m)^(\s*snapshotter\s*=\s*)[\x27\x22]overlayfs[\x27\x22]', r"\1'native'", text)
 text = re.sub(r'(?m)^(\s*use_local_image_pull\s*=\s*)false', r'\1true', text)
 text = re.sub(r'(?m)^(\s*SystemdCgroup\s*=\s*)true', r'\1false', text)
 state = sys.argv[3]
@@ -237,7 +226,7 @@ chmod 0600 "$RUNTIME_CONFIG"
 containerd --config "$RUNTIME_CONFIG" config dump >/dev/null
 for KV in \
   "K8S_VERSION=$K8S_VERSION" "CNI_VERSION=$CNI_VERSION" "NODE_IP=$NODE_IP" \
-  "NODE_IFACE=$NODE_IFACE" "PVC_MOUNT=$PVC_MOUNT" "CONTAINERD_ROOT=$CONTAINERD_ROOT" "DATA_ROOT=$DATA_ROOT" "MIN_FREE_GIB=$MIN_FREE_GIB" "RUNTIME_CONFIG=$RUNTIME_CONFIG" \
+  "NODE_IFACE=$NODE_IFACE" "CONTAINERD_ROOT=$CONTAINERD_ROOT" "DATA_ROOT=$DATA_ROOT" "MIN_FREE_GIB=$MIN_FREE_GIB" "RUNTIME_CONFIG=$RUNTIME_CONFIG" \
   "RUNTIME_STATE=$RUNTIME_STATE" "RUNTIME_SOCKET=$RUNTIME_SOCKET"; do
   printf '%s\n' "$KV"
 done > "$CONFIG_DIR/environment"
@@ -254,7 +243,6 @@ exec 9>/run/kubelet-lab-supervisor.lock
 flock -n 9 || exit 0
 echo 'Kubelet attend la configuration produite par kubeadm init ou join.'
 while true; do
-  if ! mountpoint -q "$PVC_MOUNT"; then echo "PVC absent ; kubelet non démarré."; sleep 5; continue; fi
   if [[ -s /var/lib/kubelet/config.yaml && -s /var/lib/kubelet/kubeadm-flags.env ]] &&
      [[ -s /etc/kubernetes/kubelet.conf || -s /etc/kubernetes/bootstrap-kubelet.conf ]] &&
      [[ -S $RUNTIME_SOCKET ]]; then
@@ -285,8 +273,7 @@ set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [[ $EUID == 0 ]] || { echo 'Exécuter avec sudo.' >&2; exit 1; }
 . /etc/kubernetes-lab/environment
-mountpoint -q "$PVC_MOUNT" || { echo "PVC absent sur $PVC_MOUNT ; démarrage refusé." >&2; exit 1; }
-[[ -d $DATA_ROOT && -w $DATA_ROOT ]] || { echo 'PVC inaccessible.' >&2; exit 1; }
+[[ -d $DATA_ROOT && -w $DATA_ROOT ]] || { echo 'Stockage local inaccessible.' >&2; exit 1; }
 mkdir -p "$RUNTIME_STATE" "$DATA_ROOT/logs"
 exec 7>/run/k8s-lab-start.lock
 flock -n 7 || { echo 'Démarrage déjà en cours.' >&2; exit 1; }
@@ -305,9 +292,9 @@ for ((i=0;i<30;i++)); do
 done
 ctr --address "$RUNTIME_SOCKET" version >/dev/null || { tail -n 30 "$DATA_ROOT/logs/containerd.log"; exit 1; }
 PLUGINS=$(ctr --address "$RUNTIME_SOCKET" plugins ls)
-for plugin in 'io.containerd.snapshotter.v1.*overlayfs' 'io.containerd.grpc.v1.*cri'; do
+for plugin in 'io.containerd.snapshotter.v1.*native' 'io.containerd.grpc.v1.*cri'; do
   grep -E "$plugin.*[[:space:]]ok[[:space:]]*$" <<< "$PLUGINS" >/dev/null || {
-    echo 'Plugin overlayfs ou CRI non sain.' >&2; printf '%s\n' "$PLUGINS"; exit 1;
+    echo 'Plugin native ou CRI non sain.' >&2; printf '%s\n' "$PLUGINS"; exit 1;
   }
 done
 nohup /usr/local/lib/k8s-lab/kubelet-supervisor.sh \
@@ -322,6 +309,6 @@ kubeadm version -o short
 kubelet --version
 df -h "$DATA_ROOT" /
 printf '\nNœud préparé : %s (%s).\n' "$(hostname -s)" "$NODE_IP"
-echo 'Master : sudo bash master.sh'
-echo 'Worker : exécuter la commande join affichée par master.sh.'
-echo 'Logs : /var/lib/containerd/k8s-lab/logs/{containerd,kubelet}.log'
+echo 'Master : sudo bash master_local.sh'
+echo 'Worker : exécuter la commande join affichée par master_local.sh.'
+echo 'Logs : /var/lib/k8s-lab/logs/{containerd,kubelet}.log'

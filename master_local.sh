@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Initialise un NOUVEAU master après all_nodes.sh et affiche le join des workers.
+# Initialise un NOUVEAU master après all_nodes_local.sh et affiche le join des workers.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NODE_NAME=lab-master
@@ -62,7 +62,7 @@ run_with_status() (
 die() { echo "ERREUR : $*" >&2; exit 1; }
 help() {
   cat <<'EOF'
-sudo bash master.sh [options]
+sudo bash master_local.sh [options]
   --node-name NOM       Défaut lab-master
   --flannel-version V  Défaut v0.28.9 (manifeste versionné)
   --flannel-mtu N      MTU du chemin sous-jacent, AVANT les 50 octets VXLAN
@@ -70,7 +70,7 @@ sudo bash master.sh [options]
   --token-ttl DURÉE    Défaut 2h
   --help
 
-Préparer d'abord tous les nœuds avec all_nodes.sh. Ce script refuse un master
+Préparer d'abord tous les nœuds avec all_nodes_local.sh. Ce script refuse un master
 déjà initialisé et ne lance jamais kubeadm reset. Le join des workers est
 une commande kubeadm standard, avec le socket dédié et l'exception du lab.
 EOF
@@ -87,16 +87,15 @@ while (($#)); do
     -h|--help) help; exit 0;; *) die "Option inconnue : $1";;
   esac
 done
-[[ $EUID == 0 ]] || die "Exécuter avec sudo bash master.sh."
-[[ -r /etc/kubernetes-lab/environment ]] || die "Exécuter all_nodes.sh d'abord."
+[[ $EUID == 0 ]] || die "Exécuter avec sudo bash master_local.sh."
+[[ -r /etc/kubernetes-lab/environment ]] || die "Exécuter all_nodes_local.sh d'abord."
 . /etc/kubernetes-lab/environment
 [[ $NODE_NAME =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && ${#NODE_NAME} -le 63 ]] || die 'Nom de nœud invalide.'
 [[ $FLANNEL_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Version Flannel invalide.'
 [[ $TOKEN_TTL =~ ^[0-9]+[hm]$ ]] || die 'Durée du token attendue : 2h, 60m, etc.'
-[[ ${PVC_MOUNT:-} == /var/lib/containerd && $DATA_ROOT == /var/lib/containerd/k8s-lab && ${CONTAINERD_ROOT:-} == /var/lib/containerd ]] || die "Préparer un nouveau lab avec la version PVC de all_nodes.sh."
-mountpoint -q "$PVC_MOUNT" || die "PVC absent sur $PVC_MOUNT."
-[[ -d $DATA_ROOT && -w $DATA_ROOT ]] || die "PVC inaccessible."
-[[ $(df -Pk "$DATA_ROOT" | awk 'END {print $4}') -ge 2097152 ]] || die "Moins de 2 Gio libres avant initialisation. Agrandir le PVC ou libérer son espace."
+[[ $DATA_ROOT == /var/lib/k8s-lab && ${CONTAINERD_ROOT:-} == /var/lib/containerd ]] || die "Préparer un nouveau lab avec la version locale de all_nodes_local.sh."
+[[ -d $DATA_ROOT && -w $DATA_ROOT ]] || die "Stockage local inaccessible."
+[[ $(df -Pk "$DATA_ROOT" | awk 'END {print $4}') -ge 2097152 ]] || die "Moins de 2 Gio libres avant initialisation. Libérer de l’espace sur le disque local."
 [[ ! -f /etc/kubernetes/admin.conf && ! -f /etc/kubernetes/manifests/kube-apiserver.yaml && ! -d $DATA_ROOT/etcd/member ]] ||
   die 'Master déjà initialisé ou installation partielle. Aucun reset automatique.'
 exec 8>/etc/kubernetes-lab/master.lock
@@ -175,7 +174,7 @@ with open('/etc/hosts','w') as f: f.write('\n'.join(result)+'\n')
 PY
 kubeadm config validate --config "$CONFIG"
 
-echo '[1/4] Téléchargement des images sur le PVC'
+echo '[1/4] Téléchargement des images sur le disque local'
 run_with_status "Pull et décompression des images Kubernetes" "$DATA_ROOT/logs/images-pull.log" \
   kubeadm config images pull --config "$CONFIG"
 echo '[2/4] Initialisation du control plane (kubelet démarre automatiquement)'
@@ -230,7 +229,7 @@ chmod 0600 "$DATA_ROOT/join-command.sh"
 kubectl get nodes -o wide
 kubectl get pods -A -o wide
 df -h "$DATA_ROOT" /
-printf '\nSur CHAQUE worker, après all_nodes.sh, exécuter :\n\n%s\n\n' "$JOIN"
+printf '\nSur CHAQUE worker, après all_nodes_local.sh, exécuter :\n\n%s\n\n' "$JOIN"
 echo "Le token expire dans $TOKEN_TTL. La commande contient un secret : ne pas la publier."
 echo "Optionnel : ajouter --node-name lab-worker-1 ou lab-worker-2 à la commande."
 echo "Fichier privé : $DATA_ROOT/join-command.sh"
